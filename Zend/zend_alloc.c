@@ -79,6 +79,7 @@ void zend_debug_alloc_output(char *format, ...)
 
 #if (defined (__GNUC__) && __GNUC__ > 2 ) && !defined(__INTEL_COMPILER) && !defined(DARWIN) && !defined(__hpux) && !defined(_AIX)
 static void zend_mm_panic(const char *message) __attribute__ ((noreturn));
+static void zend_mm_safe_error_ex(const char *format, ...) __attribute__ ((noreturn));
 #endif
 
 static void zend_mm_panic(const char *message)
@@ -91,7 +92,28 @@ static void zend_mm_panic(const char *message)
 #if ZEND_DEBUG && defined(HAVE_KILL) && defined(HAVE_GETPID)
 	kill(getpid(), SIGSEGV);
 #endif
-	exit(1);
+	_exit(1);
+}
+
+/* Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618): a recoverable E_ERROR here
+ * unwinds via zend_bailout() (longjmp), which can resume request handling
+ * with the allocator or VM stack left mid-mutation. Exit immediately
+ * instead of trying to continue past an OOM/overflow condition. */
+static void zend_mm_safe_error_ex(const char *format, ...)
+{
+	va_list args;
+	char buf[1024];
+
+	va_start(args, format);
+	vsnprintf(buf, sizeof(buf), format, args);
+	va_end(args);
+
+	fprintf(stderr, "\nFatal error: %s\n", buf);
+/* See http://support.microsoft.com/kb/190351 */
+#ifdef PHP_WIN32
+	fflush(stderr);
+#endif
+	_exit(1);
 }
 
 /*******************/
@@ -1740,6 +1762,10 @@ ZEND_API void zend_mm_shutdown(zend_mm_heap *heap, int full_shutdown, int silent
 	}
 }
 
+/* Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618): this used to raise a
+ * recoverable E_ERROR and zend_bailout() (longjmp), which could resume
+ * request handling with the heap mid-mutation. Report and exit the
+ * process directly instead of unwinding back into the running request. */
 static void zend_mm_safe_error(zend_mm_heap *heap,
 	const char *format,
 	size_t limit,
@@ -1749,59 +1775,39 @@ static void zend_mm_safe_error(zend_mm_heap *heap,
 #endif
 	size_t size)
 {
-	if (heap->reserve) {
-		_zend_mm_free_int(heap, heap->reserve ZEND_FILE_LINE_CC ZEND_FILE_LINE_EMPTY_CC);
-		heap->reserve = NULL;
+	const char *error_filename;
+	uint error_lineno;
+	TSRMLS_FETCH();
+
+	if (zend_is_compiling(TSRMLS_C)) {
+		error_filename = zend_get_compiled_filename(TSRMLS_C);
+		error_lineno = zend_get_compiled_lineno(TSRMLS_C);
+	} else if (EG(in_execution)) {
+		error_filename = EG(active_op_array)?EG(active_op_array)->filename:NULL;
+		error_lineno = EG(opline_ptr)?(*EG(opline_ptr))->lineno:0;
+	} else {
+		error_filename = NULL;
+		error_lineno = 0;
 	}
-	if (heap->overflow == 0) {
-		const char *error_filename;
-		uint error_lineno;
-		TSRMLS_FETCH();
-		if (zend_is_compiling(TSRMLS_C)) {
-			error_filename = zend_get_compiled_filename(TSRMLS_C);
-			error_lineno = zend_get_compiled_lineno(TSRMLS_C);
-		} else if (EG(in_execution)) {
-			error_filename = EG(active_op_array)?EG(active_op_array)->filename:NULL;
-			error_lineno = EG(opline_ptr)?(*EG(opline_ptr))->lineno:0;
-		} else {
-			error_filename = NULL;
-			error_lineno = 0;
-		}
-		if (!error_filename) {
-			error_filename = "Unknown";
-		}
-		heap->overflow = 1;
-		zend_try {
-			zend_error_noreturn(E_ERROR,
-				format,
-				limit,
+	if (!error_filename) {
+		error_filename = "Unknown";
+	}
+
+	fprintf(stderr, "\nFatal error: ");
+	fprintf(stderr,
+		format,
+		limit,
 #if ZEND_DEBUG
-				filename,
-				lineno,
+		filename,
+		lineno,
 #endif
-				size);
-		} zend_catch {
-			if (heap->overflow == 2) {
-				fprintf(stderr, "\nFatal error: ");
-				fprintf(stderr,
-					format,
-					limit,
-#if ZEND_DEBUG
-					filename,
-					lineno,
-#endif
-					size);
-				fprintf(stderr, " in %s on line %d\n", error_filename, error_lineno);
-			}
+		size);
+	fprintf(stderr, " in %s on line %d\n", error_filename, error_lineno);
 /* See http://support.microsoft.com/kb/190351 */
 #ifdef PHP_WIN32
-			fflush(stderr);
+	fflush(stderr);
 #endif
-		} zend_end_try();
-	} else {
-		heap->overflow = 2;
-	}
-	zend_bailout();
+	_exit(1);
 }
 
 static zend_mm_free_block *zend_mm_search_large_block(zend_mm_heap *heap, size_t true_size)
@@ -2472,7 +2478,7 @@ static inline size_t safe_address(size_t nmemb, size_t size, size_t offset)
 	       "rm"(offset));
 
 	if (UNEXPECTED(overflow)) {
-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
 		return 0;
 	}
 	return res;
@@ -2501,7 +2507,7 @@ static inline size_t safe_address(size_t nmemb, size_t size, size_t offset)
 
 #undef LP_SUFF
         if (UNEXPECTED(overflow)) {
-                zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+                zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
                 return 0;
         }
         return res;
@@ -2522,7 +2528,7 @@ static inline size_t safe_address(size_t nmemb, size_t size, size_t offset)
                "1"(0));
 
         if (UNEXPECTED(overflow)) {
-                zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+                zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
                 return 0;
         }
         return res;
@@ -2542,7 +2548,7 @@ static inline size_t safe_address(size_t nmemb, size_t size, size_t offset)
                "r"(offset));
 
         if (UNEXPECTED(overflow)) {
-                zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+                zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
                 return 0;
         }
         return res;
@@ -2555,7 +2561,7 @@ static inline size_t safe_address(size_t nmemb, size_t size, size_t offset)
 	zend_ulong64 res = (zend_ulong64)nmemb * (zend_ulong64)size + (zend_ulong64)offset;
 
 	if (UNEXPECTED(res > (zend_ulong64)0xFFFFFFFFL)) {
-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
 		return 0;
 	}
 	return (size_t) res;
@@ -2570,7 +2576,7 @@ static inline size_t safe_address(size_t nmemb, size_t size, size_t offset)
 	double _delta = (double)res - _d;
 
 	if (UNEXPECTED((_d + _delta ) != _d)) {
-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
 		return 0;
 	}
 	return res;
@@ -2582,7 +2588,7 @@ ZEND_API void *_safe_emalloc_string(size_t nmemb, size_t size, size_t offset ZEN
 {
 	size_t str_size = safe_address(nmemb, size, offset);
 	if (UNEXPECTED(str_size > INT_MAX)) {
-		zend_error_noreturn(E_ERROR, "String allocation overflow, max size is %d", INT_MAX);
+		zend_mm_safe_error_ex("String allocation overflow, max size is %d", INT_MAX);
 	}
 	return emalloc_rel(str_size);
 }

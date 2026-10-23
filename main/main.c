@@ -1784,6 +1784,7 @@ void php_request_shutdown_for_hook(void *dummy)
 		for (i = 0; i < NUM_TRACK_VARS; i++) {
 			if (PG(http_globals)[i]) {
 				zval_ptr_dtor(&PG(http_globals)[i]);
+				PG(http_globals)[i] = NULL;
 			}
 		}
 	} zend_end_try();
@@ -1809,6 +1810,10 @@ void php_request_shutdown_for_hook(void *dummy)
 		zend_signal_deactivate(TSRMLS_C);
 	} zend_end_try();
 #endif
+
+	/* Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619): may be read before the
+	 * next php_request_startup() completes if this worker bails out early. */
+	PG(modules_activated) = 0;
 }
 
 /* }}} */
@@ -1880,6 +1885,7 @@ void php_request_shutdown(void *dummy)
 		for (i=0; i<NUM_TRACK_VARS; i++) {
 			if (PG(http_globals)[i]) {
 				zval_ptr_dtor(&PG(http_globals)[i]);
+				PG(http_globals)[i] = NULL;
 			}
 		}
 	} zend_end_try();
@@ -1937,6 +1943,10 @@ void php_request_shutdown(void *dummy)
 #ifdef HAVE_DTRACE
 	DTRACE_REQUEST_SHUTDOWN(SAFE_FILENAME(SG(request_info).path_translated), SAFE_FILENAME(SG(request_info).request_uri), (char *)SAFE_FILENAME(SG(request_info).request_method));
 #endif /* HAVE_DTRACE */
+
+	/* Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619): may be read before the
+	 * next php_request_startup() completes if this worker bails out early. */
+	PG(modules_activated) = 0;
 }
 /* }}} */
 

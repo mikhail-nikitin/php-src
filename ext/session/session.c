@@ -2669,7 +2669,10 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 	if (php_session_rfc1867_orig_callback) {
 		retval = php_session_rfc1867_orig_callback(event, event_data, extra TSRMLS_CC);
 	}
-	if (!PS(rfc1867_enabled)) {
+	/* Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619): minimal mitigation for EOL
+	 * version, disable session.upload_progress outright rather than make
+	 * the reentrant progress-tracking path here safe. */
+	if (!PS(rfc1867_enabled) || 1) {
 		return retval;
 	}
 
